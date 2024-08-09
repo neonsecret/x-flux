@@ -215,6 +215,7 @@ def main():
             with accelerator.accumulate(dit):
                 img, prompts = batch
                 with torch.no_grad():
+                    img = img[:, :3, :]
                     x_1 = vae.encode(img.to(accelerator.device).to(torch.float32))
                     inp = prepare(t5=t5, clip=clip, img=x_1, prompt=prompts)
                     x_1 = rearrange(x_1, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
