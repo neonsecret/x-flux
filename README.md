@@ -22,7 +22,7 @@ You can download them on HuggingFace:
 ### LoRA
 
 ```bash
-accelerate launch train_flux_lora_deepspeed.py --config "train_configs/test_lora.yaml"
+accelerate launch --config_file "conf.yaml" train_flux_lora_deepspeed.py --config "train_configs/test_lora.yaml"
 ```
 
 ### ControlNet
