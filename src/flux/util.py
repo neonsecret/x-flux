@@ -3,17 +3,26 @@ from dataclasses import dataclass
 
 import torch
 import json
-from einops import rearrange
+import cv2
+import numpy as np
+from PIL import Image
 from huggingface_hub import hf_hub_download
+from safetensors import safe_open
 from safetensors.torch import load_file as load_sft
+
+from optimum.quanto import requantize
 
 from .model import Flux, FluxParams
 from .controlnet import ControlNetFlux
 from .modules.autoencoder import AutoEncoder, AutoEncoderParams
 from .modules.conditioner import HFEmbedder
-from optimum.quanto import requantize
+from .annotator.dwpose import DWposeDetector
+from .annotator.mlsd import MLSDdetector
+from .annotator.canny import CannyDetector
+from .annotator.midas import MidasDetector
+from .annotator.hed import HEDdetector
+from .annotator.tile import TileDetector
 
-from safetensors import safe_open
 
 def load_safetensors(path):
     tensors = {}
@@ -21,6 +30,76 @@ def load_safetensors(path):
         for key in f.keys():
             tensors[key] = f.get_tensor(key)
     return tensors
+
+def get_lora_rank(checkpoint):
+    for k in checkpoint.keys():
+        if k.endswith(".down.weight"):
+            return checkpoint[k].shape[0]
+
+def load_checkpoint(local_path, repo_id, name):
+    if local_path is not None:
+        if '.safetensors' in local_path:
+            print("Loading .safetensors checkpoint...")
+            checkpoint = load_safetensors(local_path)
+        else:
+            print("Loading checkpoint...")
+            checkpoint = torch.load(local_path, map_location='cpu')
+    elif repo_id is not None and name is not None:
+        print("Loading checkpoint from repo id...")
+        checkpoint = load_from_repo_id(repo_id, name)
+    else:
+        raise ValueError(
+            "LOADING ERROR: you must specify local_path or repo_id with name in HF to download"
+        )
+    return checkpoint
+
+
+def c_crop(image):
+    width, height = image.size
+    new_size = min(width, height)
+    left = (width - new_size) / 2
+    top = (height - new_size) / 2
+    right = (width + new_size) / 2
+    bottom = (height + new_size) / 2
+    return image.crop((left, top, right, bottom))
+
+
+class Annotator:
+    def __init__(self, name: str, device: str):
+        if name == "canny":
+            processor = CannyDetector()
+        elif name == "openpose":
+            processor = DWposeDetector(device)
+        elif name == "depth":
+            processor = MidasDetector()
+        elif name == "hed":
+            processor = HEDdetector()
+        elif name == "hough":
+            processor = MLSDdetector()
+        elif name == "tile":
+            processor = TileDetector()
+        self.name = name
+        self.processor = processor
+
+    def __call__(self, image: Image, width: int, height: int):
+        image = c_crop(image)
+        image = image.resize((width, height))
+        image = np.array(image)
+        if self.name == "canny":
+            result = self.processor(image, low_threshold=100, high_threshold=200)
+        elif self.name == "hough":
+            result = self.processor(image, thr_v=0.05, thr_d=5)
+        elif self.name == "depth":
+            result = self.processor(image)
+            result, _ = result
+        else:
+            result = self.processor(image)
+
+        if result.ndim != 3:
+            result = result[:, :, None]
+            result = np.concatenate([result, result, result], axis=2)
+        return result
+
 
 @dataclass
 class ModelSpec:
@@ -219,9 +298,11 @@ def load_flow_model_quintized(name: str, device: str | torch.device = "cuda", hf
     sd = load_sft(ckpt_path, device='cpu')
     with open(json_path, "r") as f:
         quantization_map = json.load(f)
+    print("Start a quantization process...")
     requantize(model, sd, quantization_map, device=device)
-
+    print("Model is quantized!")
     return model
+
 def load_controlnet(name, device, transformer=None):
     with torch.device(device):
         controlnet = ControlNetFlux(configs[name].params)
@@ -231,8 +312,7 @@ def load_controlnet(name, device, transformer=None):
 
 def load_t5(device: str | torch.device = "cuda", max_length: int = 512) -> HFEmbedder:
     # max length 64, 128, 256 and 512 should work (if your sequence is short enough)
-    return HFEmbedder("google/t5-v1_1-xxl", max_length=max_length, torch_dtype=torch.bfloat16).to(device)
-
+    return HFEmbedder("xlabs-ai/xflux_text_encoders", max_length=max_length, torch_dtype=torch.bfloat16).to(device)
 
 def load_clip(device: str | torch.device = "cuda") -> HFEmbedder:
     return HFEmbedder("openai/clip-vit-large-patch14", max_length=77, torch_dtype=torch.bfloat16).to(device)
